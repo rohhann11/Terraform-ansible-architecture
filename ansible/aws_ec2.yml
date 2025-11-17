@@ -1,0 +1,17 @@
+# aws_ec2.yml
+plugin: amazon.aws.aws_ec2  # 👈 Use FQCN for the plugin too
+regions:
+  - us-east-1
+hostnames:
+  - instance-id
+filters:
+  instance-state-name: running
+keyed_groups:
+  - key: tags
+    prefix: tag
+compose:
+  ansible_host: instance_id
+  # ❌ Remove ansible_connection from here
+  ansible_aws_ssm_instance_id: "{{ instance_id }}"
+  ansible_aws_ssm_region: "{{ ec2_placement_region }}"
+  ansible_aws_ssm_bucket_name: "my-ansible-s3-bucketx"

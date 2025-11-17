@@ -1,0 +1,22 @@
+# ssm.yml
+---
+- name: Test SSM Connection to EC2 Instance
+  hosts: all
+  connection: amazon.aws.aws_ssm  # ✅ Set connection here
+  gather_facts: false
+  vars:
+    ansible_aws_ssm_bucket_name: "my-ansible-s3-bucketx"
+
+  tasks:
+    - name: Display connection details
+      debug:
+        msg: |
+          Connecting to: {{ inventory_hostname }}
+          Bucket: {{ ansible_aws_ssm_bucket_name }}
+
+    - name: Test connection with ping module
+      ping:
+
+    - name: Display success message
+      debug:
+        msg: "✅ Successfully connected to {{ inventory_hostname }} via AWS SSM!"

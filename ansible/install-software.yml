@@ -1,0 +1,45 @@
+---
+- name: Install software on all running instances via SSM
+  hosts: all
+  connection: amazon.aws.aws_ssm
+  become: yes
+  gather_facts: true
+  vars:
+    ansible_aws_ssm_bucket_name: "my-ansible-s3-bucketx"
+    ansible_aws_ssm_s3_addressing_style: virtual
+
+  tasks:
+    - name: Install common packages (Linux)
+      package:
+        name:
+          - curl
+          - wget
+          - unzip
+        state: present
+      when: ansible_os_family != "Windows"
+
+    - name: Install nginx on RedHat-based systems (e.g., Amazon Linux)
+      package:
+        name: nginx
+        state: present
+      when: ansible_os_family == "RedHat"
+
+    - name: Install apache2 on Debian-based systems (e.g., Ubuntu)
+      package:
+        name: apache2
+        state: present
+      when: ansible_os_family == "Debian"
+
+    - name: Start and enable nginx (Amazon Linux)
+      systemd:
+        name: nginx
+        state: started
+        enabled: true
+      when: ansible_os_family == "RedHat"
+
+    - name: Start and enable apache2 (Ubuntu)
+      systemd:
+        name: apache2
+        state: started
+        enabled: true
+      when: ansible_os_family == "Debian"
