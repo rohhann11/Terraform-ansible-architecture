@@ -73,16 +73,47 @@ data "aws_iam_role" "ssm_role" {
 
 
 
+
+# EBS Volume for manual EC2 instance
+# EBS Volume for manual EC2 instance
+resource "aws_ebs_volume" "manual_ec2_volume" {
+  availability_zone = "us-east-1a"  # Same AZ as the manual instance
+  size              = 5            # 20 GB
+  type              = "gp3"         # General Purpose SSD
+  encrypted         = true
+
+  tags = {
+    Name = "manual-ec2-volume"
+  }
+}
+
+# Attach EBS volume to manual EC2 instance
+resource "aws_volume_attachment" "manual_ec2_volume_attach" {
+  device_name = "/dev/xvdh"  # Use /dev/sdh for additional volume
+  volume_id   = aws_ebs_volume.manual_ec2_volume.id
+  instance_id = aws_instance.ubuntu_ec2.id
+  skip_destroy = true  # Prevent issues during Terraform destroy
+}
+
+
+
+
+
 resource "aws_instance" "ubuntu_ec2" {
-  ami                         = "ami-00577b9fe23424613" # Ubuntu 20.04 LTS in us-east-1 (find the latest AMI for your region)
+  ami                         = "ami-00577b9fe23424613"
   instance_type               = "t2.micro"
   subnet_id                   = aws_subnet.demo_subnet["a"].id
   associate_public_ip_address = true
+  iam_instance_profile        = data.aws_iam_role.ssm_role.name
 
-  # Attach the existing SSM IAM Role
-  iam_instance_profile = data.aws_iam_role.ssm_role.name
+  # Root volume configuration
+  root_block_device {
+    volume_size = 20
+    volume_type = "gp3"
+    encrypted   = true
+    delete_on_termination = true
+  }
 
-  # Install SSM agent if it's not already installed (optional)
   user_data = <<-EOF
               #!/bin/bash
               # Update and install SSM agent
@@ -90,14 +121,48 @@ resource "aws_instance" "ubuntu_ec2" {
               sudo apt-get install -y amazon-ssm-agent
               sudo systemctl enable amazon-ssm-agent
               sudo systemctl start amazon-ssm-agent
+
+              # Wait for EBS volume to be attached as /dev/xvdh
+              while [ ! -b "/dev/xvdh" ]; do
+                  echo "Waiting for EBS volume to be attached..."
+                  sleep 5
+              done
+
+              # Check if disk is already formatted
+              if ! blkid /dev/xvdh; then
+                  echo "Formatting /dev/xvdh as ext4"
+                  sudo mkfs -t ext4 /dev/xvdh
+              fi
+              
+              # Create mount point
+              sudo mkdir -p /mnt/data
+              
+              # Mount the volume
+              sudo mount /dev/xvdh /mnt/data
+              
+              # Add to fstab for automatic mount on reboot
+              echo '/dev/xvdh /mnt/data ext4 defaults,nofail 0 2' | sudo tee -a /etc/fstab
+              
+              # Set permissions
+              sudo chown -R ubuntu:ubuntu /mnt/data
+              sudo chmod -R 755 /mnt/data
+              
+              # Create a test file
+              sudo -u ubuntu bash -c 'echo "This is manual instance EBS data" > /mnt/data/manual-test.txt'
+              
+              echo "Manual instance EBS volume mounted at /mnt/data"
               EOF
 
   tags = {
     Name = "Ubuntu-SSM-EC2"
   }
-
-  monitoring = false # Enable detailed monitoring (optional)
+  monitoring = false
 }
+
+
+
+
+
 
 
 # Output the EC2 instance public IP (or private IP based on your needs)
@@ -191,8 +256,25 @@ resource "aws_lb_target_group_attachment" "manual_instance_attachment" {
 # Step 6: Auto Scaling Group (ASG) setup
 resource "aws_launch_template" "asg_launch_template" {
   name          = "asg-launch-template"
-  image_id      = "ami-00577b9fe23424613" # Use your own AMI
+  image_id      = "ami-00577b9fe23424613"
   instance_type = "t2.micro"
+  
+  # Add IAM instance profile for EBS permissions
+  iam_instance_profile {
+    name = data.aws_iam_role.ssm_role.name
+  }
+  
+  # Root volume
+  block_device_mappings {
+    device_name = "/dev/sda1"
+    ebs {
+      volume_size           = 20
+      volume_type           = "gp3"
+      delete_on_termination = true
+      encrypted             = true
+    }
+  }
+
   network_interfaces {
     associate_public_ip_address = true
     security_groups             = [aws_security_group.asg_sg.id]
@@ -200,10 +282,89 @@ resource "aws_launch_template" "asg_launch_template" {
 
   user_data = base64encode(<<-EOF
 #!/bin/bash
-echo "Running startup scripts"
+# Update system
+sudo apt-get update -y
+sudo apt-get install -y amazon-ssm-agent awscli
+
+sudo systemctl enable amazon-ssm-agent
+sudo systemctl start amazon-ssm-agent
+
+# Get instance metadata
+INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+AZ=$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)
+REGION=$(echo $AZ | sed 's/.$//')
+
+echo "Starting EBS volume creation for instance: $INSTANCE_ID"
+
+# Create EBS volume WITHOUT TAGS (remove --tag-specifications)
+VOLUME_ID=$(aws ec2 create-volume \
+    --region $REGION \
+    --availability-zone $AZ \
+    --size 5 \
+    --volume-type gp3 \
+    --encrypted \
+    --query 'VolumeId' --output text)
+
+if [ $? -eq 0 ]; then
+    echo "Successfully created EBS volume: $VOLUME_ID"
+    
+    # Wait for volume to be available
+    echo "Waiting for volume to be available..."
+    aws ec2 wait volume-available --volume-ids $VOLUME_ID --region $REGION
+    
+    # Attach volume to instance
+    echo "Attaching volume to instance..."
+    aws ec2 attach-volume \
+        --device /dev/xvdh \
+        --instance-id $INSTANCE_ID \
+        --volume-id $VOLUME_ID \
+        --region $REGION
+    
+    # Wait for volume to be attached
+    echo "Waiting for volume attachment..."
+    counter=0
+    max_attempts=30
+    while [ $counter -lt $max_attempts ]; do
+        if [ -b "/dev/xvdh" ]; then
+            echo "EBS volume attached successfully"
+            
+            # Format and mount
+            echo "Formatting and mounting volume..."
+            sudo mkfs -t ext4 /dev/xvdh
+            sudo mkdir -p /mnt/data
+            sudo mount /dev/xvdh /mnt/data
+            echo '/dev/xvdh /mnt/data ext4 defaults,nofail 0 2' | sudo tee -a /etc/fstab
+            sudo chown -R ubuntu:ubuntu /mnt/data
+            sudo chmod -R 755 /mnt/data
+            
+            # Create test file
+            sudo -u ubuntu bash -c 'echo "Dynamic EBS volume created by ASG - Instance: $(hostname)" > /mnt/data/dynamic-test.txt'
+            echo "Dynamic EBS volume created and mounted at /mnt/data"
+            break
+        fi
+        echo "Attempt $((counter + 1)): Volume not attached yet..."
+        sleep 5
+        ((counter++))
+    done
+    
+    if [ $counter -eq $max_attempts ]; then
+        echo "Failed to attach volume after $max_attempts attempts"
+    fi
+else
+    echo "Failed to create EBS volume. Check IAM permissions."
+fi
 EOF
-  )
+)
 }
+
+
+
+
+
+
+
+
+
 
 resource "aws_autoscaling_group" "asg" {
   desired_capacity          = 1
