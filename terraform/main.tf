@@ -353,6 +353,68 @@ if [ $? -eq 0 ]; then
 else
     echo "Failed to create EBS volume. Check IAM permissions."
 fi
+
+
+
+
+# === MOUNT EFS AND COPY FILES ===
+echo "Setting up EFS for file copy..."
+
+# Create EFS mount point
+sudo mkdir -p /mnt/efs
+
+# Mount EFS using access point
+echo "Mounting EFS..."
+sudo mount -t efs -o tls,accesspoint=${aws_efs_access_point.app_files_ap.id} ${aws_efs_file_system.app_files.id}:/ /mnt/efs
+
+# Make EFS mount persistent
+echo "${aws_efs_file_system.app_files.id} /mnt/efs efs tls,accesspoint=${aws_efs_access_point.app_files_ap.id},_netdev 0 0" | sudo tee -a /etc/fstab
+
+# Wait for EFS to be mounted
+sleep 10
+
+# === COPY FILES FROM EFS TO EBS ===
+echo "Copying files from EFS to local EBS volume..."
+
+# Check if EFS has files to copy
+if [ -d "/mnt/efs" ] && [ "$(ls -A /mnt/efs 2>/dev/null)" ]; then
+    echo "Found files in EFS, copying to /mnt/data..."
+    
+    # Copy all files from EFS to EBS volume
+    sudo cp -r /mnt/efs/* /mnt/data/ 2>/dev/null || true
+    
+    # Set proper permissions on copied files
+    sudo chown -R ubuntu:ubuntu /mnt/data/
+    sudo chmod -R 755 /mnt/data/
+    
+    echo "Files successfully copied from EFS to EBS volume"
+    
+    # List copied files for verification
+    echo "Copied files:"
+    ls -la /mnt/data/
+else
+    echo "No files found in EFS or EFS is empty"
+    
+    # Create a marker file to show EFS was accessed
+    sudo -u ubuntu bash -c 'echo "EFS was mounted but no files were found for copying. Instance: $(hostname)" > /mnt/data/efs-copy-status.txt'
+fi
+
+# === UNMOUNT EFS (OPTIONAL) ===
+# If you don't need EFS mounted after copying, unmount it
+echo "Unmounting EFS after file copy..."
+sudo umount /mnt/efs
+# Remove from fstab if you don't want persistent mount
+sudo sed -i '/efs/d' /etc/fstab
+
+# Create final test file
+sudo -u ubuntu bash -c 'echo "ASG instance setup completed. Files copied from EFS to EBS. Instance: $(hostname) - $(date)" > /mnt/data/setup-complete.txt'
+
+echo "Instance setup completed successfully"
+echo "EFS files copied to EBS volume at /mnt/data"
+
+
+
+
 EOF
 )
 }
@@ -448,6 +510,83 @@ resource "aws_cloudwatch_metric_alarm" "low_cpu" {
 # Output the ASG name
 output "asg_name" {
   value = aws_autoscaling_group.asg.name
+}
+
+
+
+
+
+
+
+
+# EFS Security Group
+resource "aws_security_group" "efs_sg" {
+  name_prefix = "efs-sg"
+  description = "Security group for EFS"
+  vpc_id      = aws_vpc.demo_vpc.id
+
+  # Allow NFS traffic from ASG security group
+  ingress {
+    from_port       = 2049
+    to_port         = 2049
+    protocol        = "tcp"
+    security_groups = [aws_security_group.asg_sg.id]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "efs-sg"
+  }
+}
+
+# EFS File System
+resource "aws_efs_file_system" "app_files" {
+  creation_token   = "app-files-efs"
+  encrypted        = true
+  performance_mode = "generalPurpose"
+  throughput_mode  = "bursting"
+
+  tags = {
+    Name = "app-files-efs"
+  }
+}
+
+# EFS Mount Targets in each subnet
+resource "aws_efs_mount_target" "efs_mount_targets" {
+  for_each = aws_subnet.demo_subnet
+
+  file_system_id  = aws_efs_file_system.app_files.id
+  subnet_id       = each.value.id
+  security_groups = [aws_security_group.efs_sg.id]
+}
+
+# EFS Access Point for app files
+resource "aws_efs_access_point" "app_files_ap" {
+  file_system_id = aws_efs_file_system.app_files.id
+
+  posix_user {
+    gid = 1000
+    uid = 1000
+  }
+
+  root_directory {
+    path = "/app"
+    creation_info {
+      owner_gid   = 1000
+      owner_uid   = 1000
+      permissions = "755"
+    }
+  }
+
+  tags = {
+    Name = "app-files-access-point"
+  }
 }
 
 
