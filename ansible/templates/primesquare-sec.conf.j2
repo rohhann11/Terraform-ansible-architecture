@@ -1,0 +1,45 @@
+# Disable server signature on error pages and directory listings
+ServerSignature Off
+
+# Only show minimal information about the server
+ServerTokens Prod
+
+<VirtualHost *:80>
+    ServerName ps-iifl-az-qa-func.primesoft.net
+    DocumentRoot "/var/www/html/prime-square"
+
+    ErrorLog /var/log/apache2/ps-error.log
+    CustomLog /var/log/apache2/ps-access.log combined
+
+    <IfModule mod_headers.c>
+        Header set Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:;"
+        Header set X-Content-Type-Options "nosniff"
+        Header set Cache-Control "no-store, no-cache, must-revalidate"
+        Header set X-Frame-Options "DENY"
+        Header set Access-Control-Allow-Origin "*"
+        Header set X-XSS-Protection "1; mode=block"
+    </IfModule>
+
+    ProxyPreserveHost On
+    ProxyTimeout 600
+
+    ProxyPass /prime-square http://localhost:3804/prime-square
+    ProxyPassReverse /prime-square http://localhost:3804/prime-square
+
+    <Directory /var/www/html/prime-square>
+        Options FollowSymLinks
+        AllowOverride None
+        Require all granted
+
+        RewriteEngine On
+        RewriteBase /prime-square
+
+        RewriteCond %{REQUEST_FILENAME} !-f
+        RewriteCond %{REQUEST_FILENAME} !-d
+        RewriteRule ^(.*)$ /#/$1 [L]
+
+        RewriteCond %{REQUEST_METHOD} ^(TRACE|TRACK)
+        RewriteRule .* - [F,L]
+    </Directory>
+
+</VirtualHost>

@@ -3,24 +3,41 @@
   hosts: all
   connection: amazon.aws.aws_ssm
   become: yes
-  gather_facts: true
+  gather_facts: false
   vars:
     ansible_aws_ssm_bucket_name: "my-ansible-s3-bucketx"
     ansible_aws_ssm_s3_addressing_style: virtual
 
   tasks:
 
+    # -------------------------------
+    # Manually gather OS information
+    # -------------------------------
+    - name: Get OS info
+      shell: cat /etc/os-release
+      register: osinfo
+      changed_when: false
+
+    # -------------------------------
+    # Wait for APT lock to be released
+    # -------------------------------
     - name: Wait for apt lock to be released
       shell: |
-        while fuser /var/lib/dpkg/lock >/dev/null 2>&1 ||
-              fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1;
-        do
+        for i in {1..30}; do
+          if ! fuser /var/lib/dpkg/lock >/dev/null 2>&1 && \
+             ! fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then
+             exit 0
+          fi
           echo "Waiting for apt/dpkg lock..."
           sleep 5
         done
+        exit 1
       changed_when: false
-      when: ansible_os_family == "Debian"
+      when: "'ubuntu' in osinfo.stdout | lower"
 
+    # -------------------------------
+    # Install base packages
+    # -------------------------------
     - name: Install common packages (Linux)
       package:
         name:
@@ -28,27 +45,100 @@
           - wget
           - unzip
         state: present
-      when: ansible_os_family != "Windows"
+      when: "'ubuntu' in osinfo.stdout | lower"
 
-    - name: Install Apache, Java, MySQL on Debian (Ubuntu)
+    # -------------------------------
+    # Install Apache, Java 17, MySQL
+    # -------------------------------
+    - name: Install Apache, Java 17, MySQL on Debian/Ubuntu
       package:
         name:
           - apache2
           - openjdk-17-jdk
           - mysql-server
         state: present
-      when: ansible_os_family == "Debian"
+      when: "'ubuntu' in osinfo.stdout | lower"
 
+    # -------------------------------
+    # Start Apache + MySQL
+    # -------------------------------
     - name: Start and enable Apache
       systemd:
         name: apache2
         state: started
         enabled: true
-      when: ansible_os_family == "Debian"
+      when: "'ubuntu' in osinfo.stdout | lower"
 
     - name: Start and enable MySQL
       systemd:
         name: mysql
         state: started
         enabled: true
-      when: ansible_os_family == "Debian"
+      when: "'ubuntu' in osinfo.stdout | lower"
+
+    # -------------------------------
+    # Copy Apache Jinja Template
+    # -------------------------------
+    - name: Copy primesquare Apache config (Jinja template)
+      template:
+        src: templates/primesquare-sec.j2
+        dest: /etc/apache2/sites-enabled/primesquare-sec.conf
+        owner: root
+        group: root
+        mode: '0644'
+      notify: restart apache
+      when: "'ubuntu' in osinfo.stdout | lower"
+
+    # -------------------------------
+    # Enable/Disable Apache sites
+    # -------------------------------
+    - name: Enable primesquare-sec site
+      command: a2ensite primesquare-sec.conf
+      args:
+        creates: /etc/apache2/sites-enabled/primesquare-sec.conf
+      notify: restart apache
+      when: "'ubuntu' in osinfo.stdout | lower"
+
+    - name: Disable default site
+      command: a2dissite 000-default.conf
+      args:
+        removes: /etc/apache2/sites-enabled/000-default.conf
+      ignore_errors: yes
+      notify: restart apache
+      when: "'ubuntu' in osinfo.stdout | lower"
+
+    # -------------------------------
+    # Create frontend directory
+    # -------------------------------
+    - name: Ensure frontend directory exists
+      file:
+        path: /var/www/html/prime-square
+        state: directory
+        owner: www-data
+        group: www-data
+        mode: "0755"
+      when: "'ubuntu' in osinfo.stdout | lower"
+
+    # -----------------------------------------
+    # Sync frontend folder from S3 to EC2 path
+    # -----------------------------------------
+    - name: Sync frontend files from S3
+      shell: |
+        sudo aws s3 sync s3://prime-square/prime-square/frontend/ /var/www/html/prime-square/
+      notify: restart apache
+      when: "'ubuntu' in osinfo.stdout | lower"
+
+    # -------------------------------
+    # Fix permissions
+    # -------------------------------
+    - name: Fix permissions for frontend folder
+      shell: |
+        sudo chown -R www-data:www-data /var/www/html/prime-square/
+      notify: restart apache
+      when: "'ubuntu' in osinfo.stdout | lower"
+
+  handlers:
+    - name: restart apache
+      systemd:
+        name: apache2
+        state: restarted

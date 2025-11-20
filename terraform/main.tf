@@ -200,6 +200,68 @@ resource "aws_s3_bucket_public_access_block" "ansible_bucket_block" {
 
 
 
+# New S3 Bucket for application files
+resource "aws_s3_bucket" "prime_square" {
+  bucket = "prime-square"
+
+  tags = {
+    Name = "prime-square"
+    Purpose = "application-files"
+  }
+}
+
+# Block public access for the new bucket
+resource "aws_s3_bucket_public_access_block" "prime_square_block" {
+  bucket = aws_s3_bucket.prime_square.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+# Upload entire folder to S3 using null resource
+resource "null_resource" "upload_folder_to_s3" {
+  depends_on = [aws_s3_bucket.prime_square]
+
+  provisioner "local-exec" {
+    command = <<-EOT
+      echo "Uploading entire folder to S3..."
+      aws s3 sync /home/ubuntu/folder/ s3://prime-square/prime-square/
+      aws s3 sync /home/ubuntu/frontend/ s3://prime-square/frontend   
+
+      echo "Files uploaded to S3:"
+      aws s3 ls s3://prime-square/prime-square/ --recursive --human-readable
+      aws s3 ls s3://prime-square/frontend/ --recursive --human-readable 
+
+      echo "Upload completed successfully!"
+    EOT
+  }
+
+  # Trigger upload on every apply to ensure latest files
+  triggers = {
+    always_run = timestamp()
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -357,60 +419,97 @@ fi
 
 
 
-# === MOUNT EFS AND COPY FILES ===
-echo "Setting up EFS for file copy..."
 
-# Create EFS mount point
-sudo mkdir -p /mnt/efs
 
-# Mount EFS using access point
-echo "Mounting EFS..."
-sudo mount -t efs -o tls,accesspoint=${aws_efs_access_point.app_files_ap.id} ${aws_efs_file_system.app_files.id}:/ /mnt/efs
+# === DOWNLOAD FILES FROM S3 PRIME_SQUARE BUCKET ===
+echo "Setting up S3 file download from prime-square bucket..."
 
-# Make EFS mount persistent
-echo "${aws_efs_file_system.app_files.id} /mnt/efs efs tls,accesspoint=${aws_efs_access_point.app_files_ap.id},_netdev 0 0" | sudo tee -a /etc/fstab
+S3_BUCKET="prime-square"
+S3_PREFIX="prime-square"
 
-# Wait for EFS to be mounted
-sleep 10
+# Create download directory
+sudo mkdir -p /mnt/data/prime-square
 
-# === COPY FILES FROM EFS TO EBS ===
-echo "Copying files from EFS to local EBS volume..."
+echo "Downloading files from S3 bucket: $S3_BUCKET"
 
-# Check if EFS has files to copy
-if [ -d "/mnt/efs" ] && [ "$(ls -A /mnt/efs 2>/dev/null)" ]; then
-    echo "Found files in EFS, copying to /mnt/data..."
+# Check if S3 bucket exists and has files
+if aws s3 ls "s3://$S3_BUCKET/" 2>/dev/null; then
+    echo "S3 bucket accessible. Checking for files..."
     
-    # Copy all files from EFS to EBS volume
-    sudo cp -r /mnt/efs/* /mnt/data/ 2>/dev/null || true
-    
-    # Set proper permissions on copied files
-    sudo chown -R ubuntu:ubuntu /mnt/data/
-    sudo chmod -R 755 /mnt/data/
-    
-    echo "Files successfully copied from EFS to EBS volume"
-    
-    # List copied files for verification
-    echo "Copied files:"
-    ls -la /mnt/data/
+    # Download entire folder from S3
+    if aws s3 ls "s3://$S3_BUCKET/$S3_PREFIX/" 2>/dev/null; then
+        echo "Found folder in S3: $S3_PREFIX"
+        echo "Starting folder download..."
+        
+        # Sync entire folder from S3 to local directory
+        aws s3 sync "s3://$S3_BUCKET/$S3_PREFIX/" /mnt/data/prime-square/
+        
+        # Set proper permissions
+        sudo chown -R ubuntu:ubuntu /mnt/data/prime-square/
+        sudo chmod -R 755 /mnt/data/prime-square/
+        
+        # Make all shell scripts executable
+        sudo find /mnt/data/prime-square/ -name "*.sh" -exec chmod +x {} \; 2>/dev/null || true
+        
+        echo "Folder successfully downloaded from S3"
+        
+        # List downloaded files for verification
+        echo "Downloaded folder contents:"
+        find /mnt/data/prime-square/ -type f -exec ls -la {} \;
+        
+        # Get file count
+        FILE_COUNT=$(find /mnt/data/prime-square/ -type f | wc -l)
+        echo "Total files downloaded: $FILE_COUNT"
+        
+        # Copy to main data directory (optional)
+        echo "Copying files to main data directory..."
+        sudo cp -r /mnt/data/prime-square/* /mnt/data/ 2>/dev/null || true
+        
+    else
+        echo "No folder found in S3: $S3_PREFIX"
+        echo "Available objects in bucket:"
+        aws s3 ls s3://$S3_BUCKET/ --recursive || true
+    fi
 else
-    echo "No files found in EFS or EFS is empty"
-    
-    # Create a marker file to show EFS was accessed
-    sudo -u ubuntu bash -c 'echo "EFS was mounted but no files were found for copying. Instance: $(hostname)" > /mnt/data/efs-copy-status.txt'
+    echo "S3 bucket $S3_BUCKET not accessible or doesn't exist"
 fi
 
-# === UNMOUNT EFS (OPTIONAL) ===
-# If you don't need EFS mounted after copying, unmount it
-echo "Unmounting EFS after file copy..."
-sudo umount /mnt/efs
-# Remove from fstab if you don't want persistent mount
-sudo sed -i '/efs/d' /etc/fstab
+# === PROCESS DOWNLOADED FILES ===
+echo "Processing downloaded files..."
+
+# Count and list all files
+echo "Files in prime-square folder:"
+find /mnt/data/prime-square/ -type f -printf "%f\n" | while read file; do
+    echo "  - $file"
+done
+
+# Check for specific file types and set permissions
+if [ -f "/mnt/data/prime-square/wrapper.sh" ]; then
+    echo "Wrapper script found and made executable"
+fi
+
+if [ -f "/mnt/data/prime-square/encrypt.sh" ]; then
+    echo "Encrypt script found and made executable"
+fi
+
+if [ -f "/mnt/data/prime-square/core-1.1.28_IIFL_1.1.15.jar" ]; then
+    echo "JAR file found: core-1.1.28_IIFL_1.1.15.jar"
+fi
+
+if [ -f "/mnt/data/prime-square/application.properties" ]; then
+    echo "Application properties file found"
+    echo "First few lines:"
+    head -n 3 /mnt/data/prime-square/application.properties
+fi
 
 # Create final test file
-sudo -u ubuntu bash -c 'echo "ASG instance setup completed. Files copied from EFS to EBS. Instance: $(hostname) - $(date)" > /mnt/data/setup-complete.txt'
+sudo -u ubuntu bash -c 'echo "ASG instance setup completed. Entire folder downloaded from S3. Instance: $(hostname) - $(date)" > /mnt/data/setup-complete.txt'
+sudo -u ubuntu bash -c 'echo "Files downloaded: $(find /mnt/data/prime-square/ -type f | wc -l) files" >> /mnt/data/setup-complete.txt'
 
 echo "Instance setup completed successfully"
-echo "EFS files copied to EBS volume at /mnt/data"
+echo "Entire S3 folder downloaded to /mnt/data/prime-square"
+
+
 
 
 
@@ -516,78 +615,6 @@ output "asg_name" {
 
 
 
-
-
-
-# EFS Security Group
-resource "aws_security_group" "efs_sg" {
-  name_prefix = "efs-sg"
-  description = "Security group for EFS"
-  vpc_id      = aws_vpc.demo_vpc.id
-
-  # Allow NFS traffic from ASG security group
-  ingress {
-    from_port       = 2049
-    to_port         = 2049
-    protocol        = "tcp"
-    security_groups = [aws_security_group.asg_sg.id]
-  }
-
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = {
-    Name = "efs-sg"
-  }
-}
-
-# EFS File System
-resource "aws_efs_file_system" "app_files" {
-  creation_token   = "app-files-efs"
-  encrypted        = true
-  performance_mode = "generalPurpose"
-  throughput_mode  = "bursting"
-
-  tags = {
-    Name = "app-files-efs"
-  }
-}
-
-# EFS Mount Targets in each subnet
-resource "aws_efs_mount_target" "efs_mount_targets" {
-  for_each = aws_subnet.demo_subnet
-
-  file_system_id  = aws_efs_file_system.app_files.id
-  subnet_id       = each.value.id
-  security_groups = [aws_security_group.efs_sg.id]
-}
-
-# EFS Access Point for app files
-resource "aws_efs_access_point" "app_files_ap" {
-  file_system_id = aws_efs_file_system.app_files.id
-
-  posix_user {
-    gid = 1000
-    uid = 1000
-  }
-
-  root_directory {
-    path = "/app"
-    creation_info {
-      owner_gid   = 1000
-      owner_uid   = 1000
-      permissions = "755"
-    }
-  }
-
-  tags = {
-    Name = "app-files-access-point"
-  }
-}
 
 
 
